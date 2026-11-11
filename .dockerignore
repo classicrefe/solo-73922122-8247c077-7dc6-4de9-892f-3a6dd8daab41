@@ -5,5 +5,7 @@ __pycache__
 .pytest_cache
 .venv
 tests
+test_shutdown_app.py
 requirements-dev.txt
 README.md
+scripts

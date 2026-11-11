@@ -1,277 +1,145 @@
-# 水质实验室检测结果归属核对 API
+# 水质实验室检测报告发布 API
 
-用 FastAPI 接收检测任务 CSV 与仪器离线结果 CSV，求“先最多配对、再最小计划时间偏差总和”的全部最优方案，并返回：
+实验室报告员发布水样检测报告前，需要确认预览中的结果没有被更正。本服务提供：
 
-- `definite_pairs`：所有最优方案**共有**的确定配对，可安全导入实验室系统；
-- `ambiguous_tasks` / `ambiguous_results`：其余记录在某个最优方案中可能对应的候选，以及该记录是否可能在某个最优方案中未配对。
+- 检测结果登记与**修订历史**（结果 ID、样品码、项目、值；每次更正追加一条新修订，旧值永不覆盖）；
+- 选择同一水样的 **1～30 个结果 ID 预览** JSON 报告（完整内容 + 逐条修订）；
+- **携带修订号发布**：事务内复查，任一来源已更正则整份拒绝（409），无关结果的更正不影响发布；
+- 已发布内容**不可变快照**；任一来源再次更正，所有引用它的有效报告在同一事务内**自动撤回并记录原因**，即使值改回原值也不恢复有效；
+- 报告查询返回原内容、所用修订及 `valid` / `withdrawn` 状态，支持 **ETag / If-None-Match**；撤回必定改变 ETag，不会因正文不变返回 304；
+- 两个 API 进程共享一个 SQLite 数据库，更正 / 撤回 / 发布并发时**等价于串行执行**；数据持久化在 Docker 卷中，重启保留。
 
-服务不在有歧义时擅自挑选一个“看起来最像”的配对，从而避免误归属。
+## 技术栈
 
-## 快速启动
+FastAPI + Uvicorn + SQLite（WAL 模式），无额外中间件；Pydantic v2 做请求校验；Pytest + httpx 做功能、并发与双进程测试。
 
-```bash
-docker compose up --build
-```
-
-启动后：
-
-| 地址 | 用途 |
-| --- | --- |
-| <http://localhost:8000/docs> | Swagger UI，可直接上传两份 CSV 试运行 |
-| <http://localhost:8000/redoc> | ReDoc |
-| <http://localhost:8000/openapi.json> | OpenAPI 文档 |
-| <http://localhost:8000/demo/tasks.csv> | 含歧义的演示任务 CSV |
-| <http://localhost:8000/demo/results.csv> | 含歧义的演示结果 CSV |
-| <http://localhost:8000/health> | 容器健康检查 |
-
-如 8000 端口被占用：`APP_PORT=8080 docker compose up --build`。停止服务用 `docker compose down`。
-
-也可以直接用 curl：
+## 快速开始
 
 ```bash
-curl -X POST http://localhost:8000/v1/reconciliations \
-  -F "tasks=@demo/tasks.csv;type=text/csv" \
-  -F "results=@demo/results.csv;type=text/csv"
+docker compose up -d --build
+# 两个副本：
+#   api-1 -> http://localhost:8001
+#   api-2 -> http://localhost:8002
+# 交互式文档（含预览/发布/更正/条件请求示例，可直接 Try it out）：
+#   http://localhost:8001/docs
 ```
 
-在 Swagger UI 中打开 `POST /v1/reconciliations`，点击 **Try it out**，两个文件字段分别选择上面下载的演示 CSV，再点击 **Execute**。
-
-## 接口
-
-### `POST /v1/reconciliations`
-
-`multipart/form-data`，两个文件字段均为必填：
-
-| 字段 | 内容 |
-| --- | --- |
-| `tasks` | 检测任务 CSV，最多 30 行数据（不含表头） |
-| `results` | 仪器离线结果 CSV，最多 30 行数据（不含表头） |
-
-成功时返回 `200` 和如下结构：
-
-```json
-{
-  "summary": {
-    "task_records": 6,
-    "result_records": 7,
-    "eligible_candidate_pairs": 7,
-    "max_pairs": 4,
-    "minimum_total_absolute_deviation_seconds": 2700,
-    "definite_pair_count": 2,
-    "ambiguous_task_count": 4,
-    "ambiguous_result_count": 5
-  },
-  "definite_pairs": [
-    {
-      "task_id": "T-004",
-      "result_id": "R-004",
-      "sample_code": "S-300",
-      "item": "Pb",
-      "planned_time": "2026-11-11T14:00:00Z",
-      "allowed_start": "2026-11-11T13:00:00Z",
-      "allowed_end": "2026-11-11T15:00:00Z",
-      "test_time": "2026-11-11T14:10:00Z",
-      "value": "0.012",
-      "deviation_seconds": 600
-    }
-  ],
-  "ambiguous_tasks": [
-    {
-      "task_id": "T-001",
-      "sample_code": "S-100",
-      "item": "pH",
-      "planned_time": "2026-11-11T10:00:00Z",
-      "allowed_start": "2026-11-11T09:00:00Z",
-      "allowed_end": "2026-11-11T11:00:00Z",
-      "possible_result_pairs": [
-        {
-          "result_id": "R-001",
-          "test_time": "2026-11-11T09:30:00Z",
-          "value": "7.10",
-          "deviation_seconds": 1800
-        },
-        {
-          "result_id": "R-002",
-          "test_time": "2026-11-11T10:30:00Z",
-          "value": "7.20",
-          "deviation_seconds": 1800
-        }
-      ],
-      "possibly_unpaired": false
-    }
-  ],
-  "ambiguous_results": [
-    {
-      "result_id": "R-005",
-      "sample_code": "S-300",
-      "item": "Pb",
-      "test_time": "2026-11-11T14:30:00Z",
-      "value": "0.011",
-      "possible_task_pairs": [],
-      "possibly_unpaired": true
-    }
-  ]
-}
-```
-
-（示例只截取了部分数组元素；实际响应会逐条列出所有未确定记录。）
-
-#### 响应语义
-
-- `definite_pairs`：在所有最优方案中都出现的边。每条任务和结果最多出现一次。**只有这些可以自动导入。**
-- `ambiguous_tasks[*].possible_result_pairs`：该任务在至少一个最优方案中可能配对的结果全集。
-- `ambiguous_results[*].possible_task_pairs`：该结果在至少一个最优方案中可能配对的任务全集。
-- `possibly_unpaired = true`：存在至少一个最优方案令该记录不配对。即使候选列表只有一条，也不能据此自动归属。
-- `possible_*_pairs = []` 且 `possibly_unpaired = true`：该记录在所有最优方案中都只能不配对。
-- 已进入 `definite_pairs` 的任务/结果不会再出现在歧义数组中。
-
-### 错误
-
-CSV 格式、表头、字段值、行数或时间格式不合规时返回 `422`：
-
-```json
-{
-  "detail": {
-    "code": "csv_validation_error",
-    "message": "tasks CSV 表头不完整。",
-    "errors": [
-      {
-        "file": "tasks",
-        "row": 1,
-        "field": "allowed_start/allowed_end",
-        "message": "缺少允许检测时段：请提供 allowed_start 与 allowed_end 两列，或 allowed_interval 一列。"
-      }
-    ]
-  }
-}
-```
-
-`row` 是 CSV 物理行号，表头为第 1 行。两个文件都会校验，便于一次修正全部问题。
-
-## CSV 格式
-
-UTF-8（可带 BOM），逗号分隔；也兼容分号、制表符分隔。空白数据行会被跳过。
-
-### 检测任务 `tasks`
-
-| 列名 | 必填 | 说明 |
-| --- | --- | --- |
-| `task_id` | 是 | 任务唯一编号，文件内不可重复 |
-| `sample_code` | 是 | 样品码 |
-| `item` | 是 | 检测项目 |
-| `planned_time` | 是 | 计划检测时间 |
-| `allowed_start` | 是* | 允许检测时段开始（含） |
-| `allowed_end` | 是* | 允许检测时段结束（含） |
-| `allowed_interval` | 是* | 可用 `START/END` 代替上面两列，如 `2026-11-11T09:00:00Z/2026-11-11T11:00:00Z` |
-
-\* `allowed_start` + `allowed_end` 必须同时提供，**或**提供 `allowed_interval`。若同时提供，优先使用分列；分列缺失时尝试 `allowed_interval`。
-
-任务示例：
-
-```csv
-task_id,sample_code,item,planned_time,allowed_start,allowed_end
-T-001,S-100,pH,2026-11-11T10:00:00Z,2026-11-11T09:00:00Z,2026-11-11T11:00:00Z
-```
-
-### 仪器离线结果 `results`
-
-| 列名 | 必填 | 说明 |
-| --- | --- | --- |
-| `result_id` | 是 | 结果唯一编号，文件内不可重复 |
-| `sample_code` | 是 | 样品码，必须与任务完全一致才可能配对 |
-| `item` | 是 | 检测项目，必须与任务完全一致才可能配对 |
-| `test_time` | 是 | 实际检测时间 |
-| `value` | 是 | 数值，必须为有限数；响应中保留原始文本 |
-
-结果示例：
-
-```csv
-result_id,sample_code,item,test_time,value
-R-001,S-100,pH,2026-11-11T09:30:00Z,7.10
-```
-
-### 时间与文本规则
-
-- 时间必须显式标注 UTC：推荐 `YYYY-MM-DDTHH:MM:SSZ`，也接受 `+00:00`。
-- 必须是整秒；拒绝小数秒和非 UTC 偏移（如 `+08:00`）。
-- 响应中的时间统一规范化为 `YYYY-MM-DDTHH:MM:SSZ`。
-- 样品码与检测项目区分大小写，按去除首尾空白后的完整字符串精确比较。
-- 以下表头别名也可使用（大小写不敏感）：
-  - 任务：`编号/唯一编号/任务编号`、`样品码/样品编号`、`检测项目/项目`、`计划时间`、`允许检测时段`等；
-  - 结果：`结果编号/唯一编号`、`样品码/样品编号`、`检测项目/项目`、`检测时间`、`数值/结果值`等。
-  推荐仍使用上面的规范英文列名。
-
-## 优化与判定算法
-
-1. 候选边：样品码、项目精确相同，且 `allowed_start <= test_time <= allowed_end`（闭区间）。
-2. 建立源点 → 任务 → 结果 → 汇点的单位容量网络；任务-结果边费用为
-   `|test_time - planned_time|` 秒。
-3. 先求最大流（最大配对数），再在最大流下求最小费用（最小偏差总和）。
-4. 在求得的最优流上计算残量网络和合法节点势能，只保留**缩减费用为 0** 的残量弧。任意另一个同值同费用的最优解，都对应这些零费用弧构成的环流。
-5. 对零费用残量图求强连通分量（SCC）：
-   - 未使用的任务-结果边若在某个零费用环中（两端同 SCC），则它出现在某个最优解中；
-   - 已使用边的反向弧若在零费用环中，则该边可被其他最优解替换，不属于确定配对；
-   - 任务/结果与源点/汇点的反向弧是否在零费用环中，决定它是否可能未配对。
-6. 确定配对 = 当前最优解中使用、且反向弧不在任何零费用环中的边。确定配对集合不依赖每一条最优解的枚举，因此即使最优解数量很大也能快速给出精确交集和候选并集。
-
-规模上限为每侧 30 条，候选边最多 900 条；算法运行时间与网络规模多项式相关，不随最优解数量指数增长。
-
-## 演示数据说明
-
-`demo/tasks.csv` 与 `demo/results.csv` 有意覆盖：
-
-| 情形 | 记录 | 预期 |
-| --- | --- | --- |
-| 对称二选一，偏差同为 1800 秒 | `T-001` / `R-001`、`R-002` | 无确定配对；任务总会被配对，两个结果均可能未配对 |
-| 两个任务竞争同一结果 | `T-002`、`T-003` / `R-003` | 无确定配对；结果总会被配对，两个任务均可能未配对 |
-| 偏差不同，唯一最优 | `T-004` / `R-004`（600 秒）与 `R-005`（1800 秒） | `T-004-R-004` 确定；`R-005` 必然未配对 |
-| 无竞争，唯一最优 | `T-005` / `R-006` | `T-005-R-006` 确定 |
-| 无候选 | `T-006`、`R-007` | 必然未配对 |
-
-该演示的最优目标为：`max_pairs = 4`，`minimum_total_absolute_deviation_seconds = 2700`，确定配对 2 条。
-
-## 本地开发与测试
-
-需要 Python 3.11+：
+端到端演示（登记 → 预览 → 发布 → 304 → 更正 → 自动撤回 → 409 → 无关更正不影响发布）：
 
 ```bash
-python3.11 -m venv .venv
-. .venv/bin/activate
+./scripts/demo.sh http://localhost:8001
+```
+
+本地不使用 Docker 运行（需要 Python 3.11）：
+
+```bash
+pip install -r requirements.txt
+LAB_DB_PATH=./lab_reports.db uvicorn app.main:app --port 8000
+# 再以另一个 LAB_DB_PATH 指向同一文件启动第二个进程即可验证双进程行为
+```
+
+## API 一览
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/v1/results` | 登记结果，初始修订号为 1 |
+| GET | `/v1/results/{result_id}` | 查询结果与全部修订 |
+| POST | `/v1/results/{result_id}/corrections` | 更正：追加新修订，并撤回所有引用该结果的有效报告 |
+| POST | `/v1/report-preview` | 同水样 1～30 个结果 ID 预览，含逐条修订 |
+| POST | `/v1/reports` | 携带修订号发布；任一来源已更正则 409 整份拒绝 |
+| GET | `/v1/reports/{report_id}` | 查询报告，支持 `If-None-Match`（命中返回 304） |
+| GET | `/v1/reports?status=valid\|withdrawn` | 列出报告并按状态过滤 |
+| GET | `/health` | 健康检查 |
+
+### 典型流程
+
+```bash
+# 1. 登记结果
+curl -X POST localhost:8001/v1/results -H 'Content-Type: application/json' \
+  -d '{"result_id":"R-001","sample_code":"W-0001","item":"pH","value":"7.2"}'
+
+# 2. 预览，记录 current_revision
+curl -X POST localhost:8001/v1/report-preview -H 'Content-Type: application/json' \
+  -d '{"sample_code":"W-0001","result_ids":["R-001"]}'
+
+# 3. 携带修订发布
+curl -X POST localhost:8001/v1/reports -H 'Content-Type: application/json' \
+  -d '{"sample_code":"W-0001","selections":[{"result_id":"R-001","revision":1}]}'
+
+# 4. 条件查询（ETag 含双引号，是强校验器）
+curl -i localhost:8001/v1/reports/<report_id> -H 'If-None-Match: "<etag>"'
+
+# 5. 更正来源 -> 引用报告自动撤回；旧 ETag 再查返回 200 且 ETag 已变
+curl -X POST localhost:8001/v1/results/R-001/corrections \
+  -H 'Content-Type: application/json' -d '{"new_value":"7.4","reason":"复核更正"}'
+```
+
+错误响应统一为 `{"detail": {"code": "...", "message": "...", "details": ...}}`，关键 code：
+
+- `result_not_found`（404）、`report_not_found`（404）
+- `result_already_exists`（409）、`sample_mismatch`（409）
+- `stale_revision`（409）：携带的修订号已不是当前修订，整份拒绝，`details.stale_selections` 逐条列出提交值与当前值。
+
+## 数据模型
+
+```text
+results(result_id PK, sample_code, item, current_revision, created_at, updated_at)
+result_revisions(result_id, revision, value, reason, created_at, PK(result_id, revision))
+reports(report_id PK, sample_code, status[valid|withdrawn], etag_version,
+        created_at, published_at, withdrawn_at, withdraw_reason)
+report_items(report_id, item_index, result_id, sample_code, item, value,
+             revision, revision_created_at, PK(report_id, item_index))
+```
+
+- `result_revisions` 只追加：更正 = `current_revision + 1` 插入新行，历史修订原样保留。
+- `report_items` 是发布时刻的**内容快照**（值与修订号都固化），之后来源如何变化都不改写快照。
+- `reports.etag_version` 初始为 1，每次撤回 +1。
+
+## 并发正确性：为什么等价于串行
+
+两个 uvicorn 进程挂载同一个 SQLite 文件（命名卷 `lab-report-data`）。
+
+1. **WAL + busy_timeout**：读写不互斥，写冲突时第二个进程等待而不是立即报 locked。
+2. **所有写事务以 `BEGIN IMMEDIATE` 开始**（见 `app/database.py`），立即获取 RESERVED 写锁。SQLite 在 WAL 下同一时刻只允许一个写事务，因此更正、发布、撤回在全库范围被线性化，与某种串行顺序等价。
+3. **发布在同一个写事务内复查修订号**：
+   - 更正先拿锁 → 发布后拿锁时读到新 `current_revision`，与提交修订不符 → 409 拒绝，绝不产生引用过期修订的有效报告；
+   - 发布先拿锁 → 提交修订与当前一致才写入快照；随后更正拿锁时在**同一事务内**把所有引用该结果的有效报告更新为 `withdrawn` 并记录原因。
+4. 撤回语句带 `status = 'valid'` 条件并递增 `etag_version`，重复更正不会覆盖首次撤回原因与时间。
+
+测试 `tests/test_concurrency.py` 用多线程（各自独立连接，触发真实锁竞争）验证：30 轮更正/发布竞争中两种串行次序都会出现，且不存在“引用已更正来源却仍有效”的报告；20 个并发更正产生连续的 1..21 修订且无丢失。
+
+## ETag 与撤回
+
+ETag 为强校验器，对 `report_id + status + etag_version + 快照条目` 的规范化 JSON 取 SHA-256（见 `service.compute_etag`）。
+
+- 有效期间快照不可变，ETag 稳定；`If-None-Match` 命中返回 **304**（支持单个 ETag、逗号列表与 `*`）。
+- 撤回时 `status` 变为 `withdrawn` 且 `etag_version` +1，ETag 必然改变——即使报告正文一个字节都没变，条件请求也返回 **200** 与撤回原因，不会错误地 304。
+- 响应附带 `Cache-Control: must-revalidate`，防止中间缓存复用旧的 304 判定。
+
+## 重启持久化
+
+数据库文件位于命名卷 `/data/lab_reports.db`（WAL 模式另有 `-wal`/`-shm` 旁车文件）。容器重启或重建（卷保留）后，结果、修订、报告快照与撤回状态全部保留。`tests/test_multi_process.py` 启动真实 uvicorn 子进程验证：双进程共享数据、跨进程撤回可见、进程全部退出后新进程读到完全一致的报告与 ETag。
+
+## 测试
+
+```bash
 pip install -r requirements-dev.txt
-uvicorn app.main:app --reload --port 8000
 pytest -q
 ```
 
-测试包括：
+- `tests/test_api.py`：登记/更正/修订历史、预览校验、发布拒绝、不可变快照、级联撤回、改回原值不恢复、ETag 304/200 循环、撤回必变 ETag。
+- `tests/test_concurrency.py`：真实 SQLite 锁竞争下的串行等价性。
+- `tests/test_multi_process.py`：两个 uvicorn 进程共享一个数据库文件的端到端行为与重启持久化。
 
-- CSV 别名、合并时段、BOM、分号分隔、严格 UTC 校验、30 行上限、重复编号与数值校验；
-- 随机小规模图与穷举所有匹配的交叉验证（确定配对、候选并集、可能未配对均逐项比对）；
-- 演示数据预期、API 成功/422 响应、OpenAPI 与演示文件可用性。
+## 目录结构
 
-## 文件结构
-
-```
+```text
 app/
-  main.py          FastAPI 路由、OpenAPI 描述、响应组装
-  csv_parser.py    严格 CSV 解析与中文/英文表头别名
-  domain.py        任务与结果领域对象、UTC 格式化
-  optimizer.py     最大流最小费用 + 零费用残量图 SCC 分类
-  schemas.py       Pydantic 响应/错误模型（OpenAPI 文档来源）
-demo/
-  tasks.csv        歧义演示任务
-  results.csv      歧义演示结果
-tests/
-Dockerfile
-docker-compose.yml
-requirements.txt
+  config.py     # 数据库路径与常量（LAB_DB_PATH 可覆盖）
+  database.py   # WAL 连接、schema、BEGIN IMMEDIATE 事务封装
+  schemas.py    # Pydantic 请求/响应模型与 OpenAPI 示例
+  service.py    # 业务逻辑：修订、预览、发布复查、撤回、ETag
+  main.py       # FastAPI 路由、条件请求、/docs 示例
+scripts/demo.sh # 端到端 curl 演示
+tests/          # 功能 / 并发 / 双进程测试
 ```
-
-## 容器运维
-
-```bash
-docker compose ps
-docker compose logs -f api
-docker compose down
-```
-
-Compose 使用非 root 用户运行容器，并配置了 `/health` 健康检查；服务重启策略为 `unless-stopped`。

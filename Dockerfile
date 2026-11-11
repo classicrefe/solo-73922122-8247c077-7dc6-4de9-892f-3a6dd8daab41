@@ -13,7 +13,10 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY --chown=app:app app ./app
-COPY --chown=app:app demo ./demo
+
+# Owned by the unprivileged user; a named volume mounted here inherits this
+# ownership on first creation, so both replicas can write the shared SQLite DB.
+RUN mkdir --mode 750 /data && chown app:app /data
 
 USER app
 

@@ -1,1 +1,1 @@
-"""Laboratory result reconciliation service."""
+"""Laboratory water-sample report publishing service."""
